@@ -231,6 +231,7 @@ DesignConfig read_fasm(const std::string &path)
             // routing PIPs and non-slice site config: kept verbatim, decoded
             // by whichever tile model owns them
             dc.other_tiles[tile].push_back(feature.substr(tile.size() + 1));
+            if (!value.empty()) dc.other_values[tile][feature.substr(tile.size() + 1)] = value;
             continue;
         }
 

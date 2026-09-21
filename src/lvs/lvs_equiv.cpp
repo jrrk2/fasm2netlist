@@ -385,7 +385,7 @@ static int run(int argc, char **argv)
         std::map<std::string, const Cones::MemPort *> by_sym;
         for (const auto &m : gp)
             if (!m.out_sym.empty()) by_sym[m.out_sym.front()] = &m;
-        int mem_pairs = 0, mem_unpaired = 0;
+        int mem_pairs = 0, mem_unpaired = 0, mem_rows = 0, mem_content_diff = 0;
         for (const auto &t : tp) {
             if (t.out_sym.empty()) continue;
             auto want = mem_cuts.find(t.out_sym.front());
@@ -418,9 +418,36 @@ static int run(int argc, char **argv)
                 gold_grp.erase(gg);
             }
             mem_unpaired += int(gold_grp.size());
+
+            // What the cut hides: the contents AND the configuration -- a
+            // memory's widths and write modes, a DSP's inversion masks and
+            // register enables.  Compared directly, because a boundary that
+            // agrees says nothing about what the primitive does with it.
+            std::set<std::string> rows;
+            for (const auto &kv : G.contents) rows.insert(kv.first);
+            for (const auto &kv : t.contents) rows.insert(kv.first);
+            for (const auto &r : rows) {
+                auto gi = G.contents.find(r), ti = t.contents.find(r);
+                std::string gv = gi == G.contents.end() ? "0" : gi->second;
+                std::string tv = ti == t.contents.end() ? "0" : ti->second;
+                // A row the synthesis left undefined -- yosys writes the
+                // unused parity rows as x -- says nothing about what the
+                // memory should hold, exactly as a don't-care pin does at the
+                // boundary.  The fabric always has some value there.
+                if (gv.find('x') != std::string::npos) continue;
+                mem_rows++;
+                if (gv == tv) continue;
+                mem_content_diff++;
+                if (mem_content_diff <= 20)
+                    std::cout << "  DIFFER  " << t.where << " " << r << ": gold " << gv
+                              << ", gate " << tv << "\n";
+            }
         }
         std::cout << "memories: " << gp.size() << " gold, " << tp.size() << " gate, "
-                  << mem_pairs << " paired and checked at the boundary\n";
+                  << mem_pairs << " paired, " << mem_rows << " content rows compared\n";
+        if (mem_content_diff)
+            std::cout << "cut primitives: " << mem_content_diff
+                      << " contents/configuration difference(s)\n";
         if (mem_unpaired)
             std::cout << "  " << mem_unpaired
                       << " boundary group(s) named on one side only, so not checked\n";

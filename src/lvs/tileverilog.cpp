@@ -1576,7 +1576,73 @@ endmodule
         }
     }
 
-    // ---- block RAM: cut, not modelled ------------------------------------
+    // A block RAM's contents, as instance parameters.  The FASM gives each
+    // 18Kb half's rows as 256-bit literals; a 36Kb cell's rows are the two
+    // halves' rows interleaved bit by bit, the lower half supplying the even
+    // bits of each output row (the inverse of how Vivado splits a RAMB36E1
+    // across them).  Rows that are all zero are left out: that is the
+    // primitive's own default, so the parameter list stays readable and the
+    // meaning is unchanged.
+    auto fasm_row = [&](const std::string &tile, const std::string &site, const char *kind,
+                        int idx) -> std::string {
+        char key[64];
+        snprintf(key, sizeof(key), "%s.%s_%02X[255:0]", site.c_str(), kind, idx);
+        auto tv = dc.other_values.find(tile);
+        if (tv == dc.other_values.end()) return std::string(256, '0');
+        auto it = tv->second.find(key);
+        if (it == tv->second.end()) return std::string(256, '0');
+        // "256'b0101..." -- keep the bits, left-padded to the full row
+        const std::string &v = it->second;
+        size_t b = v.find('b');
+        std::string bits = b == std::string::npos ? v : v.substr(b + 1);
+        bits.erase(std::remove(bits.begin(), bits.end(), '_'), bits.end());
+        if (bits.size() < 256) bits.insert(0, 256 - bits.size(), '0');
+        return bits;
+    };
+    auto hex_of = [](const std::string &bits) {
+        std::string out;
+        for (size_t i = 0; i < bits.size(); i += 4) {
+            int v = 0;
+            for (int k = 0; k < 4; k++) v = (v << 1) | (bits[i + k] == '1' ? 1 : 0);
+            out += "0123456789abcdef"[v];
+        }
+        size_t nz = out.find_first_not_of('0');
+        return nz == std::string::npos ? std::string("0") : out.substr(nz);
+    };
+    auto content_params = [&](const BramSite &b) {
+        std::vector<std::string> ps;
+        auto add = [&](const char *kind, int idx, const std::string &bits) {
+            if (bits.find('1') == std::string::npos) return;
+            char key[32];
+            snprintf(key, sizeof(key), "%s_%02X", kind, idx);
+            ps.push_back(std::string(".") + key + "(256'h" + hex_of(bits) + ")");
+        };
+        auto build = [&](const char *kind, int rows) {
+            for (int i = 0; i < rows; i++) {
+                if (!b.is36) {
+                    add(kind, i, fasm_row(b.tile, b.cfg_site, kind, i));
+                    continue;
+                }
+                // 36Kb: interleave the halves into two rows of the whole cell
+                std::string lo = fasm_row(b.tile, "RAMB18_Y0", kind, i);
+                std::string hi = fasm_row(b.tile, "RAMB18_Y1", kind, i);
+                std::string r0(256, '0'), r1(256, '0');
+                for (int k = 0; k < 128; k++) {
+                    r0[255 - 2 * k] = lo[255 - k];
+                    r0[255 - (2 * k + 1)] = hi[255 - k];
+                    r1[255 - 2 * k] = lo[255 - (128 + k)];
+                    r1[255 - (2 * k + 1)] = hi[255 - (128 + k)];
+                }
+                add(kind, i * 2, r0);
+                add(kind, i * 2 + 1, r1);
+            }
+        };
+        build("INIT", b.is36 ? 0x40 : 0x40);
+        build("INITP", 8);
+        return ps;
+    };
+
+    // ---- block RAM: the boundary, and now the contents --------------------
     // A RAMB18E1 or RAMB36E1 is instantiated here with nothing inside it, and
     // that is the whole point.  The checker treats a memory's data outputs as
     // free variables and every one of its inputs as an obligation, so what has
@@ -1589,7 +1655,7 @@ endmodule
     // identical boundaries and different INIT strings pass here.  That is a
     // real gap and it is deliberate: `fasm2netlist` reads the contents out of
     // the bitstream, and tests/rtl/build_and_check.py compares them.
-    int brams = 0;
+    int brams = 0, bram_rows = 0;
     for (const auto &b : bram_sites) {
         if (b.canon.empty()) continue;
         // prjxray stores an inversion complemented, so the pins to invert are
@@ -1673,11 +1739,18 @@ endmodule
         else
             for (const auto &p : bram::kRamb18) wire_up(p.name, p.width, p.out, nullptr, p.name);
         if (first) continue;   // the routing touches none of it
-        body << "  " << (b.is36 ? "RAMB36E1" : "RAMB18E1") << " \\" << iname << " (" << o.str()
+        std::vector<std::string> cps = content_params(b);
+        std::string pstr;
+        for (size_t i = 0; i < cps.size(); i++) pstr += (i ? ", " : "") + cps[i];
+        body << "  " << (b.is36 ? "RAMB36E1" : "RAMB18E1")
+             << (pstr.empty() ? "" : " #(" + pstr + ")") << " \\" << iname << " (" << o.str()
              << ");\n";
+        if (!cps.empty()) bram_rows += cps.size();
         brams++;
     }
-    if (brams) std::cerr << "  block RAMs cut at their boundary: " << brams << "\n";
+    if (brams)
+        std::cerr << "  block RAMs: " << brams << " cut at their boundary, " << bram_rows
+                  << " content rows carried\n";
 
     // ---- DSP48E1: cut, not modelled -------------------------------------
     // Same treatment as a block RAM and for the same reason: nothing here
