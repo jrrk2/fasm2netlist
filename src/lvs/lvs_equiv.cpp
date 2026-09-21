@@ -33,7 +33,7 @@ void usage()
 {
     std::cerr << "usage: lvs_equiv --gold <a.v> --gate <b.v> [--top NAME]\n"
                  "                 [--solver libz3|'cmd'] [--format dimacs|smt2]\n"
-                 "                 [--dump-prefix PATH] [--quiet] [--explain]\n"
+                 "                 [--dump-prefix PATH] [--quiet] [--explain] [--only TEXT]\n"
                  "\n"
                  "  --solver libz3  the linked library, one incremental session"
               << (have_linked_z3() ? " (default)\n" : " -- NOT IN THIS BUILD\n")
@@ -61,6 +61,9 @@ static int run(int argc, char **argv)
     bool quiet = false;
     // --explain: after a failure, say which named variables each side reads.
     bool explain = false;
+    // --only TEXT: check just the registers whose name contains TEXT, for
+    // going back to a failure without re-proving everything around it.
+    std::string only;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -80,6 +83,7 @@ static int run(int argc, char **argv)
         else if (a == "--db") db = next();
         else if (a == "--device") device = next();
         else if (a == "--quiet") quiet = true;
+        else if (a == "--only") only = next();
         else if (a == "--format") solver.format = (next() == "dimacs") ? Format::Dimacs : Format::SmtLib2;
         else { usage(); return 2; }
     }
@@ -352,8 +356,10 @@ static int run(int argc, char **argv)
         return differ == 0 && unknown == 0 ? 0 : 1;
     }
 
-    for (const auto &[g, t] : common)
+    for (const auto &[g, t] : common) {
+        if (!only.empty() && g.find(only) == std::string::npos) continue;
         check(g == t ? g : (g + " = " + t), gold.next_state(g), gate.next_state(t));
+    }
     auto gate_outs = gate.output_bits();
     for (const auto &[port, bit] : gold.output_bits()) {
         // The two sides need not agree on bus-ness: gold declares an 8-bit
