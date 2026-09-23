@@ -16,6 +16,7 @@
 
 #ifdef LVS_HAVE_Z3
 #include <z3++.h>
+#include <algorithm>
 #endif
 
 namespace lvs {
