@@ -155,6 +155,11 @@ struct DesignConfig
     std::map<std::string, SliceConfig> slices;      // key: tile + "/" + site
     std::map<std::string, IoLogicConfig> iologic;   // key: tile + "/" + site
     std::map<std::string, std::vector<std::string>> other_tiles; // tile -> features
+    // The same features' values, where a feature had one: a block RAM's
+    // INIT_xx/INITP_xx rows are 256-bit literals, and dropping them is what
+    // left memory contents out of the extraction (tileverilog cut them at the
+    // boundary because it had nothing to cut with).
+    std::map<std::string, std::map<std::string, std::string>> other_values;
     std::vector<std::string> unhandled;
 
     // Canonical, sorted, one fact per line.

@@ -47,6 +47,12 @@ class Cones
         std::string where;                 // instance, for the report only
         std::vector<Group> boundary;
         std::vector<std::string> out_sym;  // the cut symbol each data bit reads
+        // What the memory starts out holding: INIT_xx/INITP_xx as canonical
+        // hex, rows of all zeros left out.  A cut hides the contents from the
+        // proof, so they are carried here and compared directly -- two block
+        // RAMs with the same boundary and different contents are not the same
+        // memory, and nothing else in this checker would notice.
+        std::map<std::string, std::string> contents;
     };
     // Every memory port in this module, in a stable order.  Built on demand:
     // it evaluates cones, so it cannot run before construction finishes.

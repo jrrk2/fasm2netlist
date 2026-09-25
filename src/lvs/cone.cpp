@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <stdexcept>
+#include <algorithm>
 
 namespace lvs {
 
@@ -455,6 +456,30 @@ Cones::Cones(const Module &m, BoolNet &net, const std::map<std::string, std::str
     }
 }
 
+// Everything a cut hides: the contents AND the configuration of a primitive
+// whose insides nothing here models.  Values are canonicalised so the two
+// sides' spellings of the same thing compare equal -- 256'h00ab and 256'hab,
+// TRUE and "TRUE", 32'd1 and 1.
+static std::map<std::string, std::string> cut_config(const Instance &inst)
+{
+    std::map<std::string, std::string> out;
+    for (const auto &pr : inst.params) {
+        std::string v = pr.value;
+        size_t tick = v.find('\'');
+        if (tick != std::string::npos && tick + 2 <= v.size()) v = v.substr(tick + 2);
+        v.erase(std::remove(v.begin(), v.end(), '_'), v.end());
+        v.erase(std::remove(v.begin(), v.end(), '"'), v.end());
+        for (auto &c : v) c = char(std::tolower(c));
+        bool numeric = !v.empty() && v.find_first_not_of("0123456789abcdefx") == std::string::npos;
+        if (numeric) {
+            size_t nz = v.find_first_not_of('0');
+            v = nz == std::string::npos ? std::string("0") : v.substr(nz);
+        }
+        if (v != "0") out[pr.name] = v;
+    }
+    return out;
+}
+
 void Cones::collect_mem_ports()
 {
     auto bits_of = [&](const Instance &inst, const std::string &pin, int n) {
@@ -483,6 +508,7 @@ void Cones::collect_mem_ports()
             // RSTRAMB a design leans on.
             MemPort mp;
             mp.where = inst.name;
+            mp.contents = cut_config(inst);
             // A port of width 0 is a port the design does not have.  The
             // synthesis still writes its data pins, usually as literal zeros
             // (LiteX ties every unused input low), while an implementation is
@@ -548,6 +574,37 @@ void Cones::collect_mem_ports()
             if (!mp.out_sym.empty()) mem_ports_.push_back(std::move(mp));
             continue;
         }
+        if (is_dsp(inst.type)) {
+            // A DSP is cut exactly as a block RAM is, and until now nothing
+            // compared what is inside it.  Its configuration decides what it
+            // computes -- which operands INMODE selects, whether ALUMODE is
+            // inverted, which registers are in the path -- so two DSPs with
+            // the same boundary and different configuration are not the same
+            // multiplier.
+            MemPort mp;
+            mp.where = inst.name;
+            mp.contents = cut_config(inst);
+            for (const auto &p : dsp::kDsp48e1) {
+                const Pin *pin = inst.find_pin(p.name);
+                if (!pin)
+                    continue;
+                int w = std::max(p.width, 1);
+                if (p.out) {
+                    for (int b = 0; b < w; b++) {
+                        std::string bn = net_of_bit(pin->conn, b);
+                        if (!bn.empty()) mp.out_sym.push_back(bn);
+                    }
+                } else {
+                    MemPort::Group g;
+                    g.what = p.name;
+                    for (int b = 0; b < w; b++) g.bits.push_back(eval_bit(pin->conn, b, 0));
+                    mp.boundary.push_back(g);
+                }
+            }
+            if (!mp.out_sym.empty()) mem_ports_.push_back(mp);
+            continue;
+        }
+
         if (RAM_PORTS.count(inst.type)) {
             // One MemPort per data port; each is 64 stored bits, which is one
             // fabric column, which is what makes them pairable one to one.
