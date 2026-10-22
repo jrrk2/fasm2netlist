@@ -112,7 +112,8 @@ if(BISON_FOUND AND FLEX_FOUND)
   add_library(lvs_verilog STATIC
     ${BISON_VerilogParser_OUTPUTS}
     ${FLEX_VerilogLexer_OUTPUTS}
-    src/lvs/verilog_reader.cpp)
+    src/lvs/verilog_reader.cpp
+    src/lvs/json_netlist.cpp)
   # two entries on purpose: the generated parser includes the defines file
   # by basename, while our own sources include it as lvs/verilog.tab.hpp
   target_include_directories(lvs_verilog PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}

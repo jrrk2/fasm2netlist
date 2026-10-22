@@ -31,7 +31,7 @@ namespace {
 
 void usage()
 {
-    std::cerr << "usage: lvs_equiv --gold <a.v> --gate <b.v> [--top NAME]\n"
+    std::cerr << "usage: lvs_equiv --gold <a.v|a.json> --gate <b.v> [--top NAME]\n"
                  "                 [--solver libcadical|libz3|'cmd'] [--format dimacs|smt2]\n"
                  "                 [--dump-prefix PATH] [--quiet] [--explain] [--only TEXT]\n"
                  "\n"
@@ -90,9 +90,16 @@ static int run(int argc, char **argv)
     }
     if (gold_path.empty() || gate_path.empty()) { usage(); return 2; }
 
+    // The gold side may be the synthesis's own JSON, which then also names its
+    // registers (--gold-json): nothing has to turn it into Verilog first
+    auto ends_with = [](const std::string &s, const std::string &x) {
+        return s.size() >= x.size() && s.compare(s.size() - x.size(), x.size(), x) == 0;
+    };
+    const bool gold_is_json = ends_with(gold_path, ".json");
+    if (gold_is_json && gold_json_p.empty()) gold_json_p = gold_path;
     Netlist gold_nl, gate_nl;
     try {
-        gold_nl = parse_verilog_file(gold_path);
+        gold_nl = gold_is_json ? parse_json_netlist_file(gold_path) : parse_verilog_file(gold_path);
         gate_nl = parse_verilog_file(gate_path);
     } catch (const std::exception &e) {
         std::cerr << "parse error: " << e.what() << "\n";
@@ -379,10 +386,13 @@ static int run(int argc, char **argv)
     // Clock polarity of every matched register: configuration, like a RAM's width.  The proof itself has no edges, so the edge a register
     // captures on is held against the bitstream here.  (Which clock net drives it is a separate question -- clocks are assumed common.)
     {
-        int pol_rows = 0, pol_diff = 0;
+        int pol_rows = 0, pol_diff = 0, never_clocked = 0;
         for (const auto &[g, t] : common) {
             int gp = gold.clock_inverted(g), tp = gate.clock_inverted(t);
             if (gp < 0 || tp < 0) continue;
+            // a clock tied to a constant never ticks, so its edge is nobody's
+            // business: the placer may fold any inversion into the slice
+            if (gold.clock_is_constant(g)) { never_clocked++; continue; }
             pol_rows++;
             if (gp == tp) continue;
             pol_diff++;
@@ -391,7 +401,9 @@ static int run(int argc, char **argv)
                 std::cout << "  DIFFER  " << (g == t ? g : g + " = " + t) << " clock edge: gold "
                           << (gp ? "falling" : "rising") << ", gate " << (tp ? "falling" : "rising") << "\n";
         }
-        std::cout << "register clock edge: " << pol_rows << " compared, " << pol_diff << " differ\n";
+        std::cout << "register clock edge: " << pol_rows << " compared, " << pol_diff << " differ";
+        if (never_clocked) std::cout << " (" << never_clocked << " with a constant clock, not compared)";
+        std::cout << "\n";
     }
     // Which BUFG clocks each matched register.  The extraction traces it only under --routed-clock; without that every register reads as not
     // traced and the row is skipped.  A synthesis register driven by something other than a BUFG (a clock straight from a pad or a BUFR) has no
@@ -505,7 +517,7 @@ static int run(int argc, char **argv)
         std::map<std::string, const Cones::MemPort *> by_sym;
         for (const auto &m : gp)
             if (!m.out_sym.empty()) by_sym[m.out_sym.front()] = &m;
-        int mem_pairs = 0, mem_unpaired = 0, mem_rows = 0, mem_content_diff = 0;
+        int mem_pairs = 0, mem_unpaired = 0, mem_rows = 0, mem_content_diff = 0, same_page = 0;
         int dsp_paired = 0, patdet_set = 0, patdet_unseen = 0;      // for the one parameter the bitstream has no bit for (below)
         std::set<const Cones::MemPort *> paired_gold;
         for (const auto &t : tp) {
@@ -535,6 +547,27 @@ static int run(int argc, char **argv)
             // part is not a boundary that justifies a cut.
             std::map<std::string, const Cones::MemPort::Group *> gold_grp;
             for (const auto &g2 : G.boundary) gold_grp[g2.what] = &g2;
+            // An address bit each side ties to a constant, the same one for
+            // reading as for writing, only chooses which part of the RAM a
+            // smaller memory uses: an 8-deep FIFO in a 64-entry column is
+            // A3..A5 tied low by the synthesis and high by nextpnr's packer,
+            // and either way every read finds what the last write left.  Such
+            // a bit is not compared, in either address.
+            std::set<size_t> page_bits;
+            {
+                auto grp = [](const Cones::MemPort &p, const char *w) -> const Cones::MemPort::Group * {
+                    for (const auto &g2 : p.boundary)
+                        if (g2.what == w) return &g2;
+                    return nullptr;
+                };
+                const auto *gr = grp(G, "read address"), *gw = grp(G, "write address");
+                const auto *tr = grp(t, "read address"), *tw = grp(t, "write address");
+                auto fixed = [](Lit r, Lit w) { return (r == LIT_TRUE || r == LIT_FALSE) && r == w; };
+                if (gr && gw && tr && tw)
+                    for (size_t i = 0; i < std::min({gr->bits.size(), gw->bits.size(), tr->bits.size(), tw->bits.size()}); i++)
+                        if (fixed(gr->bits[i], gw->bits[i]) && fixed(tr->bits[i], tw->bits[i])) page_bits.insert(i);
+                same_page += int(page_bits.size());
+            }
             for (const auto &tg : t.boundary) {
                 auto gg = gold_grp.find(tg.what);
                 if (gg == gold_grp.end()) { mem_unpaired++; continue; }
@@ -546,6 +579,7 @@ static int run(int argc, char **argv)
                     // is not a claim about the circuit.
                     if (i < gb.dontcare.size() && gb.dontcare[i]) continue;
                     if (i < tg.dontcare.size() && tg.dontcare[i]) continue;
+                    if ((tg.what == "read address" || tg.what == "write address") && page_bits.count(i)) continue;
                     check(t.where + " " + tg.what + "[" + std::to_string(i) + "]",
                           i < gb.bits.size() ? gb.bits[i] : LIT_FALSE,
                           i < tg.bits.size() ? tg.bits[i] : LIT_FALSE);
@@ -623,7 +657,9 @@ static int run(int argc, char **argv)
             }
         }
         std::cout << "memories: " << gp.size() << " gold, " << tp.size() << " gate, "
-                  << mem_pairs << " paired, " << mem_rows << " content rows compared\n";
+                  << mem_pairs << " paired, " << mem_rows << " content rows compared";
+        if (same_page) std::cout << " (" << same_page << " address bits tied to the same constant for read and write, not compared)";
+        std::cout << "\n";
         {
             // A cut primitive of the synthesis with no counterpart in the extraction was never compared -- not its boundary, not its
             // configuration -- and passing it silently is how a DSP went unchecked for as long as this tool has existed.  It is unproved.

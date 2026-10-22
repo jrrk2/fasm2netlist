@@ -254,6 +254,42 @@ RegMap build_regmap(const std::string &placement_path, const std::string &gold_j
     // the whole group out on one mux, under a name built from the site plus
     // the group: _M256 for the slice, _M128AB or _M128CD for a pair.  Any
     // one column of the group locates it.
+    // A RAM64X1D / RAM32X1D packs into two columns, <ram>/SP and <ram>/DP
+    // (nextpnr's names), each reading one port: SPO at the write address, DPO
+    // at DPRA.  Each column's read is its port's.
+    {
+        static const std::regex dual(R"(^(.*)/(SP|DP)$)");
+        const json::Value &gcells = mod->get("cells");
+        for (const auto &pv : place.members()) {
+            if (pv.second.get("type").asString() != "SLICE_LUTX") continue;
+            std::smatch m;
+            const std::string cell = pv.first;
+            if (!std::regex_match(cell, m, dual)) continue;
+            const json::Value &gc = gcells.get(m[1].str());
+            if (gc.isNull()) continue;
+            std::string gtype = gc.get("type").asString();
+            if (gtype != "RAM64X1D" && gtype != "RAM32X1D") continue;
+            std::string bel = pv.second.get("bel").asString();
+            if (bel.empty() || bel[0] < 'A' || bel[0] > 'D') continue;
+            std::string tile = pv.second.get("tile").asString();
+            std::string site = pv.second.get("site").asString();
+            const json::Value &tv = grid.get(tile);
+            if (tv.isNull()) continue;
+            std::vector<std::pair<int, std::string>> sl;
+            for (const auto &sv : tv.get("sites").members())
+                if (sv.first.rfind("SLICE_X", 0) == 0)
+                    sl.push_back({atoi(sv.first.c_str() + 7), sv.first});
+            std::sort(sl.begin(), sl.end());
+            int ord = -1;
+            for (size_t i = 0; i < sl.size(); i++)
+                if (sl[i].second == site) ord = int(i);
+            if (ord < 0) continue;
+            std::string stype = tv.get("sites").get(site).asString();
+            std::string gate = sanitise(tile + "_" + stype + "_X" + std::to_string(ord) + "_" + std::string(1, bel[0]));
+            out.mem[gate + ":DO[0]"] = m[1].str() + ":" + m[2].str() + "O[0]";
+        }
+    }
+
     {
         static const std::regex addr(R"(^(.*)/ADDR(\d)$)");
         const json::Value &gcells = mod->get("cells");

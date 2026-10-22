@@ -131,6 +131,10 @@ struct Netlist
 // a partial parse.
 Netlist parse_verilog_file(const std::string &path);
 Netlist parse_verilog_string(const std::string &text, const std::string &origin = "<string>");
+// A yosys-format JSON netlist (Verilator's --map-only-output, or yosys's
+// write_json), as the Module the Verilog reader would build from that netlist
+// split to single bits and written as Verilog.  json_netlist.cpp.
+Netlist parse_json_netlist_file(const std::string &path);
 
 } // namespace lvs
 

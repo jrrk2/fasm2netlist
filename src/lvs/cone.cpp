@@ -107,6 +107,14 @@ const std::map<std::string, int> RAM_PORTS = {{"RAM64M", 1}, {"RAM32M", 2}};
 // the tile model marks and reads out on its mux (see xcol's DEPTH).
 const std::map<std::string, int> RAM_SINGLE = {
     {"RAM32X1S", 5}, {"RAM64X1S", 6}, {"RAM128X1S", 7}, {"RAM256X1S", 8}};
+// The dual-port ones, by address width: one memory, written and read at A on
+// SPO and read at DPRA on DPO.  Packed, each port is a column of its own (the
+// placement's <ram>/SP and <ram>/DP), so each is cut and paired as a port.
+const std::map<std::string, int> RAM_DUAL = {{"RAM32X1D", 5}, {"RAM64X1D", 6}};
+bool is_dual_out(const std::string &type, const std::string &pin)
+{
+    return RAM_DUAL.count(type) && (pin == "SPO" || pin == "DPO");
+}
 
 // The block RAMs.  Unlike a distributed RAM these are not modelled at all:
 // their data outputs are cut and every one of their inputs becomes an
@@ -372,6 +380,7 @@ Cones::Cones(const Module &m, BoolNet &net, const std::map<std::string, std::str
                           ((inst.type == "IDELAYE2" || inst.type == "ODELAYE2") && pin.name == "DATAOUT") ||
                           (RAM_PORTS.count(inst.type) && pin.name.rfind("DO", 0) == 0) ||
                           (RAM_SINGLE.count(inst.type) && pin.name == "O") ||
+                          is_dual_out(inst.type, pin.name) ||
                           (is_bram(inst.type) && bram_data_out(pin.name)) ||
                           (is_dsp(inst.type) && dsp::is_data_out(pin.name.c_str())) ||
                           (is_gtx(inst.type) && gtx_channel_out(pin.name));
@@ -398,6 +407,8 @@ Cones::Cones(const Module &m, BoolNet &net, const std::map<std::string, std::str
             } else if (is_gtx(inst.type)) {
                 mem_width = std::max(expr_width(pin.conn), 1);
             } else if (RAM_SINGLE.count(inst.type) && pin.name == "O") {
+                mem_width = 1;
+            } else if (is_dual_out(inst.type, pin.name)) {
                 mem_width = 1;
             } else if (!memory_as_state_ && RAM_PORTS.count(inst.type) &&
                        pin.name.rfind("DO", 0) == 0) {
@@ -543,10 +554,16 @@ static std::map<std::string, std::string> cut_config(const Instance &inst)
 
 void Cones::collect_mem_ports()
 {
+    // A bus pin's bits, or -- where the primitive declares one pin per bit, as
+    // the distributed RAMs do (A0..A5, DPRA0..DPRA5) -- those pins in turn
     auto bits_of = [&](const Instance &inst, const std::string &pin, int n) {
         std::vector<Lit> v;
         const Pin *p = inst.find_pin(pin);
-        for (int i = 0; i < n; i++) v.push_back(p ? eval_bit(p->conn, i, 0) : LIT_FALSE);
+        for (int i = 0; i < n; i++) {
+            if (p) { v.push_back(eval_bit(p->conn, i, 0)); continue; }
+            const Pin *pb = inst.find_pin(pin + std::to_string(i));
+            v.push_back(pb ? eval_expr(pb->conn, 0) : LIT_FALSE);
+        }
         return v;
     };
     auto lit_of = [&](const Instance &inst, const std::string &pin, Lit dflt) {
@@ -560,6 +577,8 @@ void Cones::collect_mem_ports()
         return g;
     };
 
+    std::set<std::string> read_nets;   // nets something reads, for the dual-port RAMs below
+    bool read_nets_built = false;
     for (const auto &inst : mod_.instances) {
         if (is_bram(inst.type)) {
             // A block RAM's boundary is its whole input side.  Listing it from
@@ -805,6 +824,50 @@ void Cones::collect_mem_ports()
             }
             continue;
         }
+        if (RAM_DUAL.count(inst.type)) {
+            // Two ports onto one memory, both written at A.  A port whose
+            // output nothing reads is not one: the placer keeps no column for
+            // it, and its write side is the other port's, compared there.
+            if (!read_nets_built) {
+                read_nets_built = true;
+                auto note = [&](const Expr &e, const Instance *by, const std::string &pin) {
+                    for (int b = 0, w = std::max(expr_width(e), 1); b < w; b++) {
+                        std::string n = net_of_bit(e, b);
+                        if (n.empty()) continue;
+                        auto d = driver_.find(n);
+                        const bool driving = d != driver_.end() && d->second.inst == by && d->second.pin == pin;
+                        if (!driving) read_nets.insert(resolve(n));
+                    }
+                };
+                for (const auto &i2 : mod_.instances)
+                    for (const auto &p2 : i2.pins) note(p2.conn, &i2, p2.name);
+                for (const auto &a : mod_.assigns) note(a.rhs, nullptr, "");
+                for (const auto &pd : mod_.ports)
+                    if (pd.dir != PortDecl::Dir::Input)
+                        for (int b = 0; b < pd.range.width(); b++)
+                            read_nets.insert(resolve(pd.range.scalar ? pd.name : bit_name(pd.name, std::min(pd.range.msb, pd.range.lsb) + b)));
+            }
+            int abits = RAM_DUAL.at(inst.type);
+            for (const char *port : {"SPO", "DPO"}) {
+                const Pin *op = inst.find_pin(port);
+                const std::string on = op ? net_of_bit(op->conn, 0) : std::string();
+                if (on.empty() || !read_nets.count(resolve(on))) continue;
+                MemPort mp;
+                mp.where = inst.name + " " + port;
+                mp.boundary.push_back(group("read address", bits_of(inst, std::string(port) == "SPO" ? "A" : "DPRA", abits)));
+                mp.boundary.push_back(group("write address", bits_of(inst, "A", abits)));
+                {
+                    MemPort::Group g = group("write data", {lit_of(inst, "D", LIT_FALSE)});
+                    const Pin *dp = inst.find_pin("D");
+                    g.dontcare.assign(1, !dp || bit_is_dontcare(dp->conn, 0));
+                    mp.boundary.push_back(std::move(g));
+                }
+                mp.boundary.push_back(group("write enable", {lit_of(inst, "WE", LIT_FALSE)}));
+                mp.out_sym.push_back(mem_cut_name(inst.name, port, 0));
+                mem_ports_.push_back(std::move(mp));
+            }
+            continue;
+        }
         if (RAM_SINGLE.count(inst.type)) {
             int abits = RAM_SINGLE.at(inst.type);
             MemPort mp;
@@ -1001,6 +1064,11 @@ Lit Cones::eval_cell_output(const Instance &inst, const std::string &pin, int de
         return LIT_FALSE;
     }
 
+    if (is_dual_out(inst.type, pin)) {
+        std::string key = mem_cut_name(inst.name, pin, 0);
+        auto c = mem_cut_.find(key);
+        return net_.input(c == mem_cut_.end() ? key : c->second);
+    }
     if (RAM_SINGLE.count(inst.type) && pin == "O") {
         std::string key = mem_cut_name(inst.name, "O", 0);
         auto c = mem_cut_.find(key);
@@ -1499,6 +1567,19 @@ int Cones::clock_inverted(const std::string &state) const
     const bool by_type = ff.type.size() > 2 && ff.type.compare(ff.type.size() - 2, 2, "_1") == 0;
     const bool by_param = param_str(ff, "IS_C_INVERTED", "0").back() == '1';
     return (by_type != by_param) ? 1 : 0;
+}
+
+bool Cones::clock_is_constant(const std::string &state) const
+{
+    auto it = ff_by_state_.find(state);
+    if (it == ff_by_state_.end()) return false;
+    const Instance &ff = *it->second;
+    if (is_xcol(ff.type)) return false;
+    const Pin *c = ff.find_pin("C");
+    if (!c) return false;
+    if (c->conn.kind == Expr::Kind::Const) return true;
+    std::string n = net_of_bit(c->conn, 0);
+    return !n.empty() && const_net_.count(resolve(n)) > 0;
 }
 
 std::string Cones::clock_source(const std::string &state) const
