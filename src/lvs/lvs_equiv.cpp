@@ -602,7 +602,8 @@ static int run(int argc, char **argv)
                 {"USE_PATTERN_DETECT", "nopatdet"}, {"MASK", "3fffffffffff"}};
             static const std::map<std::string, std::string> kRamDefault = {
                 {"RAM_MODE", "tdp"}, {"WRITE_MODE_A", "writefirst"}, {"WRITE_MODE_B", "writefirst"},
-                {"RAM_EXTENSION_A", "none"}, {"RAM_EXTENSION_B", "none"}};
+                {"RAM_EXTENSION_A", "none"}, {"RAM_EXTENSION_B", "none"}, {"EN_ECC_READ", "false"}, {"EN_ECC_WRITE", "false"},
+                {"RDADDR_COLLISION_HWCONFIG", "delayedwrite"}, {"RSTREG_PRIORITY_A", "rstreg"}, {"RSTREG_PRIORITY_B", "rstreg"}};
             const auto &dflt = G.dsp ? kDspDefault : kRamDefault;
             auto value_of = [&](const std::map<std::string, std::string> &m, const std::string &row) {
                 auto it = m.find(row);
