@@ -5,6 +5,7 @@
 #ifndef LVS_SOLVER_HPP
 #define LVS_SOLVER_HPP
 
+#include <cstdint>
 #include <memory>
 #include <string>
 

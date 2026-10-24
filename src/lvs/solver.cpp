@@ -10,9 +10,19 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
+
+#ifdef _WIN32
+// popen runs cmd.exe, which returns the exit code itself, discards output with
+// NUL and says 9009 for a command it cannot find
+#define LVS_DEVNULL "NUL"
+#define LVS_NOT_FOUND(status) ((status) == 9009)
+#else
+#include <sys/wait.h>
+#define LVS_DEVNULL "/dev/null"
+#define LVS_NOT_FOUND(status) (WIFEXITED(status) && WEXITSTATUS(status) == 127)
+#endif
 
 #ifdef LVS_HAVE_CADICAL
 #include <cadical.hpp>
@@ -57,7 +67,7 @@ Result run_solver(const Solver &solver, const std::string &text)
         out << text;
     }
 
-    std::string cmd = solver.command + " " + path.string() + " 2>/dev/null";
+    std::string cmd = solver.command + " " + path.string() + " 2>" LVS_DEVNULL;
     std::string output;
     int status = -1;
     if (FILE *pipe = ::popen(cmd.c_str(), "r")) {
@@ -73,7 +83,7 @@ Result run_solver(const Solver &solver, const std::string &text)
     // register unknown and looks exactly like a proof that did not go
     // through.  The shell says 127 when it cannot find the command; that is a
     // setup fault, not a result, and it is worth failing loudly over.
-    if (status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 127)
+    if (status != -1 && LVS_NOT_FOUND(status))
         throw std::runtime_error("solver not found: '" + solver.command +
                                  "'. Install it, or pass --solver with one that exists"
                                  " (a build linked against libz3 defaults to --solver libz3).");
