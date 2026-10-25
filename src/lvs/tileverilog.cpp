@@ -2535,7 +2535,22 @@ endmodule
     if (!simple_clock) {
         std::map<std::string, std::string> bufg_in;     // BUFGCTRL site -> traced terminal root
         std::map<std::string, bool> bufg_fabric;        // ...and whether the path went through the general routing (INT tiles)
-        for (const auto &o : bufg_outs) {
+        // bufg_outs has the buffers whose output some routing names; a buffer that drives nothing (kept by the synthesis, its output unused)
+        // has no such feature, but its IN_USE one still says it is there, and its input is routed like any other
+        std::vector<std::string> bufgs = bufg_outs;
+        for (const auto &kv : dc.other_tiles) {
+            if (kv.first.rfind("CLK_BUFG", 0) != 0) continue;
+            for (const auto &feat : kv.second) {
+                static const std::string pre = "BUFGCTRL.BUFGCTRL_X0Y", suf = ".IN_USE";
+                if (feat.rfind(pre, 0) != 0 || feat.size() <= pre.size() + suf.size() ||
+                    feat.compare(feat.size() - suf.size(), suf.size(), suf) != 0)
+                    continue;
+                bufgs.push_back(tw(kv.first, "CLK_BUFG_BUFGCTRL" + std::to_string(atoi(feat.c_str() + pre.size())) + "_O"));
+            }
+        }
+        std::sort(bufgs.begin(), bufgs.end());
+        bufgs.erase(std::unique(bufgs.begin(), bufgs.end()), bufgs.end());
+        for (const auto &o : bufgs) {
             auto pos = o.find("BUFGCTRL");
             if (pos == std::string::npos || o.size() < 2 || o.compare(o.size() - 2, 2, "_O") != 0) continue;
             int n = atoi(o.c_str() + pos + 8);
