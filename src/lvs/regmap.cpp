@@ -649,7 +649,17 @@ RegMap build_regmap(const std::string &placement_path, const std::string &gold_j
             out.skipped++;
             continue;
         }
-        const json::Value &cell = mod->get("cells").get(pv.first);
+        // A flip-flop nextpnr replicated after placement ("<cell>$dup<n>",
+        // see replicate.cc) stands for its original: it carries the same
+        // next-state function, so it is labelled with the original's net and
+        // the checker proves it against the original's cone.
+        std::string gold_name = pv.first;
+        {
+            auto dup = gold_name.rfind("$dup");
+            if (dup != std::string::npos && mod->get("cells").get(gold_name).isNull())
+                gold_name = gold_name.substr(0, dup);
+        }
+        const json::Value &cell = mod->get("cells").get(gold_name);
         if (cell.isNull()) {
             out.skipped++;
             continue;

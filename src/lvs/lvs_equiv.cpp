@@ -202,6 +202,7 @@ static int run(int argc, char **argv)
     // Match by any shared name, not just an identical one.  With --map the
     // gate's states already carry the gold's names, so this is an equality.
     std::vector<std::pair<std::string, std::string>> common;   // (gold, gate)
+    std::vector<std::pair<std::string, std::string>> duplicates; // (gold, a gate copy of it)
     {
         // Index the gate side by every name it could be matched on: the label
         // the placement gave it if it has one, else each of its own synonyms.
@@ -220,26 +221,38 @@ static int run(int argc, char **argv)
         }
         for (const auto &g : gold.states()) {
             const std::string *best = nullptr;
+            std::set<std::string> all;
             for (const auto &n : gold.synonyms(g)) {
                 auto it = gate_by_name.find(n);
                 if (it == gate_by_name.end() || it->second.empty()) continue;
                 const std::string &cand = *it->second.begin();
                 if (!best || cand < *best) best = &cand;
+                all.insert(it->second.begin(), it->second.end());
             }
-            if (best) common.emplace_back(g, *best);
+            if (!best) continue;
+            common.emplace_back(g, *best);
+            // Every other gate register the placement labelled with this
+            // gold name is a replicated copy (nextpnr's <cell>$dup<n>): it
+            // carries the same next-state function and its readers see the
+            // gold symbol, so it is proved against the same cone.
+            for (const auto &t : all)
+                if (t != *best) duplicates.emplace_back(g, t);
         }
     }
     std::sort(common.begin(), common.end());
 
     std::cout << "registers: " << gold.states().size() << " gold, " << gate.states().size()
-              << " gate, " << common.size() << " matched by name\n";
-    if (common.size() != gold.states().size() || common.size() != gate.states().size()) {
+              << " gate, " << common.size() << " matched by name";
+    if (!duplicates.empty()) std::cout << ", " << duplicates.size() << " replicated copies";
+    std::cout << "\n";
+    if (common.size() != gold.states().size() || common.size() + duplicates.size() != gate.states().size()) {
         // Name them.  A count says something is wrong; the names say what, and
         // an unmatched register poisons every cone downstream of it -- its two
         // sides become different free variables, so anything reading it
         // differs for a reason that has nothing to do with the logic.
         std::set<std::string> gm, tm;
         for (const auto &c : common) { gm.insert(c.first); tm.insert(c.second); }
+        for (const auto &c : duplicates) tm.insert(c.second);
         auto name_them = [](const char *side, const std::set<std::string> &all,
                             const std::set<std::string> &matched) {
             std::vector<std::string> missing;
@@ -382,6 +395,10 @@ static int run(int argc, char **argv)
     for (const auto &[g, t] : common) {
         if (!only.empty() && g.find(only) == std::string::npos) continue;
         check(g == t ? g : (g + " = " + t), gold.next_state(g), gate.next_state(t));
+    }
+    for (const auto &[g, t] : duplicates) {
+        if (!only.empty() && g.find(only) == std::string::npos) continue;
+        check(g + " = " + t + " (copy)", gold.next_state(g), gate.next_state(t));
     }
     // Clock polarity of every matched register: configuration, like a RAM's width.  The proof itself has no edges, so the edge a register
     // captures on is held against the bitstream here.  (Which clock net drives it is a separate question -- clocks are assumed common.)
