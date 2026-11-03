@@ -15,10 +15,13 @@
 #include "lvs/regmap.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include "json.hpp"
 
 #include <regex>
@@ -33,8 +36,9 @@ void usage()
 {
     std::cerr << "usage: lvs_equiv --gold <a.v|a.json> --gate <b.v> [--top NAME]\n"
                  "                 [--solver libcadical|libz3|'cmd'] [--format dimacs|smt2]\n"
-                 "                 [--dump-prefix PATH] [--quiet] [--explain] [--only TEXT]\n"
+                 "                 [--dump-prefix PATH] [--quiet] [--explain] [--only TEXT] [--jobs N]\n"
                  "\n"
+                 "  --jobs N        solve the questions on N sessions in parallel (default: the hardware threads)\n"
                  "  --solver libcadical  the linked CaDiCaL (default when built with it)\n"
               "  --solver libz3  the linked library, one incremental session"
               << (have_linked_z3() ? (have_linked_cadical() ? "\n" : " (default)\n") : " -- NOT IN THIS BUILD\n")
@@ -65,6 +69,10 @@ static int run(int argc, char **argv)
     // --only TEXT: check just the registers whose name contains TEXT, for
     // going back to a failure without re-proving everything around it.
     std::string only;
+    // --jobs N: the questions are independent, so N sessions over the one
+    // network answer them N at a time.  Each session is its own solver with
+    // its own learned clauses; the network is read-only while they run.
+    int jobs = int(std::max(1u, std::thread::hardware_concurrency()));
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -85,6 +93,7 @@ static int run(int argc, char **argv)
         else if (a == "--device") device = next();
         else if (a == "--quiet") quiet = true;
         else if (a == "--only") only = next();
+        else if (a == "--jobs") jobs = std::max(1, atoi(next().c_str()));
         else if (a == "--format") solver.format = (next() == "dimacs") ? Format::Dimacs : Format::SmtLib2;
         else { usage(); return 2; }
     }
@@ -316,24 +325,9 @@ static int run(int argc, char **argv)
         return out;
     };
 
-    auto check = [&](const std::string &label, Lit a, Lit b) {
-        Lit miter = net.mk_xor(a, b);
-        if (!dump_prefix.empty()) {
-            // the same question in a form another solver can be handed
-            std::string safe = label;
-            for (char &c : safe) if (!isalnum((unsigned char)c)) c = '_';
-            std::ofstream(dump_prefix + safe + (solver.format == Format::Dimacs ? ".cnf" : ".smt2"))
-                << emit(net, miter, solver.format);
-        }
-        auto ts = std::chrono::steady_clock::now();
-        // A miter that structural hashing has already folded to the constant 0 is proved (and to the constant 1, refuted): no solver is
-        // needed, and on a design whose two sides came from the same netlist that is nearly every question.
-        Result r = miter == 0 ? Result::Unsat : session->check(miter);
-        solver_secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
-        if (miter == 0) trivial++;
-        else if (getenv("LVS_PROFILE"))
-            std::cerr << "  [solve " << std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count() << "s] " << label << "\n";
-        asked++;
+    // One question's verdict, printed and counted.  Called in question order
+    // once the solving is done, which may have happened on several threads.
+    auto report = [&](const std::string &label, Lit a, Lit b, Result r) {
         if (r == Result::Unsat) { proved++; if (!quiet) std::cout << "  proved  " << label << "\n"; }
         else if (r == Result::Sat) {
             differ++;
@@ -383,9 +377,74 @@ static int run(int argc, char **argv)
         else { unknown++; std::cout << "  unknown " << label << "\n"; }
     };
 
+    // A question is queued, not solved on the spot: building its miter
+    // extends the shared network (cones are made on demand, and mk_xor hashes
+    // into it), which has to be finished before several sessions read the
+    // network at once.  flush() then solves the queue in parallel.
+    struct Question
+    {
+        std::string label;
+        Lit a, b, miter;
+        Result r = Result::Unknown;
+        double secs = 0;
+    };
+    std::vector<Question> pending;
+    auto check = [&](const std::string &label, Lit a, Lit b) {
+        Lit miter = net.mk_xor(a, b);
+        if (!dump_prefix.empty()) {
+            // the same question in a form another solver can be handed
+            std::string safe = label;
+            for (char &c : safe) if (!isalnum((unsigned char)c)) c = '_';
+            std::ofstream(dump_prefix + safe + (solver.format == Format::Dimacs ? ".cnf" : ".smt2"))
+                << emit(net, miter, solver.format);
+        }
+        asked++;
+        // A miter that structural hashing has already folded to the constant 0 is proved (and to the constant 1, refuted): no solver is
+        // needed, and on a design whose two sides came from the same netlist that is nearly every question.
+        if (miter == 0) {
+            trivial++;
+            report(label, a, b, Result::Unsat);
+            return;
+        }
+        pending.push_back(Question{label, a, b, miter});
+    };
+    // The sessions: the first is the one made above; more are made on the
+    // first flush that needs them.  Each is its own solver over the one,
+    // by now read-only, network.  An external command is run one at a time.
+    std::vector<std::unique_ptr<Session>> sessions;
+    sessions.push_back(std::move(session));
+    const bool linked_solver = solver.command == linked_cadical_name() || solver.command == linked_z3_name();
+    auto flush = [&]() {
+        if (pending.empty()) return;
+        const int n = linked_solver ? std::max(1, std::min<int>(jobs, int(pending.size()))) : 1;
+        while (int(sessions.size()) < n) sessions.push_back(make_session(net, solver));
+        std::atomic<size_t> next{0};
+        auto worker = [&](Session *s) {
+            for (;;) {
+                size_t i = next.fetch_add(1);
+                if (i >= pending.size()) break;
+                Question &q = pending[i];
+                auto ts = std::chrono::steady_clock::now();
+                q.r = s->check(q.miter);
+                q.secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+            }
+        };
+        std::vector<std::thread> threads;
+        for (int t = 1; t < n; t++) threads.emplace_back(worker, sessions[t].get());
+        worker(sessions[0].get());
+        for (auto &t : threads) t.join();
+        for (const Question &q : pending) {
+            solver_secs += q.secs;
+            if (getenv("LVS_PROFILE")) std::cerr << "  [solve " << q.secs << "s] " << q.label << "\n";
+            report(q.label, q.a, q.b, q.r);
+        }
+        pending.clear();
+    };
+
     for (const auto &[gn, tn] : compare)
         check(gn + " vs " + tn, gold.value_of(gn), gate.value_of(tn));
     if (!compare.empty() && common.empty()) {
+        flush();
         auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::cout << "\n" << proved << " proved, " << differ << " differ, " << unknown
                   << " unknown   (" << secs << "s)\n";
@@ -769,10 +828,12 @@ static int run(int argc, char **argv)
             std::cout << "  all present in the extraction\n";
     }
 
+    flush();
     auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::cout << "\n" << proved << " proved, " << differ << " differ, " << unknown << " unknown"
               << "   (" << secs << "s)\n";
-    std::cout << "solver time " << solver_secs << "s over " << asked << " questions (" << trivial << " already constant after structural hashing)\n";
+    std::cout << "solver time " << solver_secs << "s over " << asked << " questions (" << trivial
+              << " already constant after structural hashing), " << sessions.size() << " session(s)\n";
     // A broken loop is not a detail of the run, it is a caveat on its verdict:
     // the constant it leaves behind deletes a dependency, so a cone can prove
     // -- or differ -- for want of an input rather than on the merits.  Say so

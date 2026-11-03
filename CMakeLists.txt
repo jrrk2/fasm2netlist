@@ -122,7 +122,8 @@ if(BISON_FOUND AND FLEX_FOUND)
   target_compile_options(lvs_verilog PRIVATE -Wall -Wextra -Wno-unused-function)
   # Per-register equivalence: netlist -> cones -> miter -> whichever solver.
   add_executable(lvs_equiv src/lvs/lvs_equiv.cpp src/lvs/cone.cpp src/lvs/regmap.cpp)
-  target_link_libraries(lvs_equiv PRIVATE lvs_verilog lvs_miter)
+  find_package(Threads REQUIRED)
+  target_link_libraries(lvs_equiv PRIVATE lvs_verilog lvs_miter Threads::Threads)
   target_compile_options(lvs_equiv PRIVATE -Wall -Wextra)
 
   set(LVS_VERILOG_AVAILABLE TRUE)
