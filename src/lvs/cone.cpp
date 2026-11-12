@@ -5,6 +5,7 @@
 #include "bram_ports.hpp"
 #include "dsp_ports.hpp"
 #include "gtpins.hpp"
+#include "hardblock_ports.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -37,16 +38,15 @@ const std::map<std::string, std::string> BIDIR_RECEIVE = {{"IOBUF", "IO"}, {"IOB
 const std::set<std::string> WIDE_MUX = {"MUXF7", "MUXF8", "MUXF9"};
 
 // Hard blocks with an output no Boolean model can produce, and the pins to cut
-// at.  A PLL's LOCKED is the case in hand: it does not say anything about the
-// design's signals, it says whether an analogue loop has settled, so neither
-// netlist can compute it and the only sound thing is to give both sides the
-// SAME free variable -- paired by the placement, exactly as a memory read is.
-//
-// What this does not check is the MMCM's configuration.  Nothing here could:
-// the divisors decide what frequency comes out, and a frequency is not a
-// Boolean fact.  The clock tree those outputs feed is assumed rather than
-// reconstructed for the same reason (see the note on clock pins below), and
-// this is the same assumption reaching one signal further.
+// at.  The clock managers and the ICAP are not listed here: they are cut at
+// every pin, inputs included, from src/hardblock_ports.hpp (see
+// collect_mem_ports).  A PLL's LOCKED was the first case: it says whether an
+// analogue loop has settled, not anything about the design's signals, so the
+// only sound thing is to give both sides the SAME free variable, paired by the
+// placement.  An MMCM's DRP read data and an ICAP's configuration read are the
+// same kind of thing.  What the cut does not check is a clock manager's
+// configuration: the divisors decide what frequency comes out, and a frequency
+// is not a Boolean fact.
 //
 // The DDR registers in the I/O logic are here for a different reason.  Both
 // sides CAN compute them, but not in a way a combinational miter can compare:
@@ -58,18 +58,6 @@ const std::set<std::string> WIDE_MUX = {"MUXF7", "MUXF8", "MUXF9"};
 // downstream of a pad reads a symbol the other side has never heard of, and
 // differs for that reason alone.
 const std::map<std::string, std::set<std::string>> OPAQUE_OUT = {
-    {"MMCME2_ADV", {"LOCKED"}},
-    {"PLLE2_ADV", {"LOCKED"}},
-    // The same block under the name synthesis gives it.  A bitstream only
-    // knows the site, which is always the ADV superset, but yosys emits
-    // whichever primitive the design instantiated -- and a design that asks
-    // for no dynamic reconfiguration asks for the BASE one.  Cutting only
-    // the ADV name cuts one side of the pair: the gate side becomes a free
-    // variable and the gold side tries to evaluate through a clock manager,
-    // so everything reading LOCKED differs for a reason that has nothing to
-    // do with the design.  The placement pairs them by site either way.
-    {"MMCME2_BASE", {"LOCKED"}},
-    {"PLLE2_BASE", {"LOCKED"}},
     {"IDDR", {"Q1", "Q2"}},
     {"ODDR", {"Q"}},
     // A shift register's output is a function of what was shifted in over the last N clocks, which no cone of this cycle
@@ -383,7 +371,8 @@ Cones::Cones(const Module &m, BoolNet &net, const std::map<std::string, std::str
                           is_dual_out(inst.type, pin.name) ||
                           (is_bram(inst.type) && bram_data_out(pin.name)) ||
                           (is_dsp(inst.type) && dsp::is_data_out(pin.name.c_str())) ||
-                          (is_gtx(inst.type) && gtx_channel_out(pin.name));
+                          (is_gtx(inst.type) && gtx_channel_out(pin.name)) ||
+                          hardblock::out_width(inst.type, pin.name) > 0;
             if (!is_out)
                 continue;
             // A memory's data output is a BUS, and every bit of it has to
@@ -406,6 +395,9 @@ Cones::Cones(const Module &m, BoolNet &net, const std::map<std::string, std::str
                     if (pin.name == p2.name) mem_width = std::max(p2.width, 1);
             } else if (is_gtx(inst.type)) {
                 mem_width = std::max(expr_width(pin.conn), 1);
+            } else if (hardblock::out_width(inst.type, pin.name) > 0) {
+                // A clock manager or the ICAP: every output bit is a cut, named as the register map pairs it (<block>:<pin>[<bit>]).
+                mem_width = hardblock::out_width(inst.type, pin.name);
             } else if (RAM_SINGLE.count(inst.type) && pin.name == "O") {
                 mem_width = 1;
             } else if (is_dual_out(inst.type, pin.name)) {
@@ -735,6 +727,57 @@ void Cones::collect_mem_ports()
                 }
             }
             if (!mp.out_sym.empty()) mem_ports_.push_back(mp);
+            continue;
+        }
+        if (hardblock::is_hardblock(inst.type)) {
+            // A clock manager or the ICAP, cut at every pin as a DSP is (src/hardblock_ports.hpp).  Every input but a clock is an
+            // obligation, so a DRP write is proved to reach the same address with the same data and enables, and an ICAP access to be
+            // requested the same way.  A pin the synthesis does not have (a BASE clock manager has no DRP) or did not connect is a
+            // don't-care, and so is every bit of it: the group is still listed, so both sides name the same groups and none goes
+            // uncounted.  Paired by site, through the placement, as a DSP is.
+            //
+            // The configuration is not compared, with one exception.  A clock manager's divisors and phases decide a frequency, which is
+            // not a Boolean fact, and the bitstream spells them as counter settings this checker does not decode.  An ICAP's width is
+            // one bit in the bitstream and decides how its I and O pins are read, so it is compared.
+            MemPort mp;
+            mp.where = inst.name;
+            mp.hard = true;
+            // As a number: the comparison skips any value with an x in it as one the synthesis left undefined, which "X32" would be.
+            if (inst.type == "ICAPE2") {
+                std::string w = param_str(inst, "ICAP_WIDTH", "X32");
+                if (!w.empty() && (w[0] == 'X' || w[0] == 'x')) w = w.substr(1);
+                mp.contents["ICAP_WIDTH"] = w;
+            }
+            // A port whose clock is constant cannot act: with DCLK held, nothing on the DRP is ever sampled, and with PSCLK held the
+            // phase shifter never steps.  The synthesis ties such a port's inputs low and the bitstream may leave them on the
+            // interconnect pull-up; neither is a claim about the design.  Judged on each side by that side's own clock pin.
+            auto clock_held = [&](const char *clk) {
+                const Pin *c = inst.find_pin(clk);
+                if (!c || bit_is_dontcare(c->conn, 0)) return true;
+                const Lit v = eval_bit(c->conn, 0, 0);
+                return v == LIT_TRUE || v == LIT_FALSE;
+            };
+            const bool drp_held = clock_held("DCLK"), ps_held = clock_held("PSCLK");
+            for (const auto &p : hardblock::ports_of(inst.type)) {
+                if (p.out || p.clock) continue;
+                const Pin *pin = inst.find_pin(p.name);
+                const int w = p.width ? p.width : 1;
+                const std::string pn = p.name;
+                const bool held = inst.type != "ICAPE2" &&
+                                  ((drp_held && (pn == "DADDR" || pn == "DI" || pn == "DEN" || pn == "DWE")) ||
+                                   (ps_held && (pn == "PSEN" || pn == "PSINCDEC")));
+                // A control pin is compared as the site sees it: after IS_<pin>_INVERTED, as a block RAM's is.
+                const bool inv = !p.width && param_str(inst, std::string("IS_") + p.name + "_INVERTED", "1'b0").back() == '1';
+                MemPort::Group g;
+                g.what = p.name;
+                for (int b = 0; b < w; b++) {
+                    Lit v = pin ? eval_bit(pin->conn, b, 0) : LIT_FALSE;
+                    g.bits.push_back(inv ? negate(v) : v);
+                    g.dontcare.push_back(held || !pin || bit_is_dontcare(pin->conn, b));
+                }
+                mp.boundary.push_back(std::move(g));
+            }
+            mem_ports_.push_back(std::move(mp));
             continue;
         }
 

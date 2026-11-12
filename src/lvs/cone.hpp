@@ -54,6 +54,7 @@ class Cones
         // memory, and nothing else in this checker would notice.
         std::map<std::string, std::string> contents;
         bool dsp = false;     // a DSP48E1 (else a block RAM): which defaults apply to a parameter the synthesis leaves out
+        bool hard = false;    // a clock manager or the ICAP (src/hardblock_ports.hpp): paired by site, as a DSP is
         bool patdet_used = false;   // a DSP whose pattern-detector outputs (PATTERNDETECT, PATTERNBDETECT, OVERFLOW, UNDERFLOW) go somewhere
     };
     // Every memory port in this module, in a stable order.  Built on demand:

@@ -582,11 +582,11 @@ static int run(int argc, char **argv)
     if (!mem_cuts.empty() || !gold.mem_ports().empty() || !gate.mem_ports().empty()) {
         const auto &gp = gold.mem_ports();
         const auto &tp = gate.mem_ports();
-        // A DSP has no read symbols to pair by.  The placement says which extracted instance each synthesis DSP became (the same map the
+        // A DSP, a clock manager or the ICAP has no read symbols to pair by.  The placement says which extracted instance each synthesis DSP became (the same map the
         // hard-block check below uses), so pair through that.
         std::map<std::string, const Cones::MemPort *> gold_by_where;
         for (const auto &m : gp)
-            if (m.dsp) gold_by_where[m.where] = &m;
+            if (m.dsp || m.hard) gold_by_where[m.where] = &m;
         // Pair by the symbol a memory's first read produces: the placement
         // already renamed the gate's to the gold's, so equal symbols are the
         // paired memories, whatever either side calls anything else.
@@ -598,7 +598,7 @@ static int run(int argc, char **argv)
         std::set<const Cones::MemPort *> paired_gold;
         for (const auto &t : tp) {
             const Cones::MemPort *gptr = nullptr;
-            if (t.dsp) {
+            if (t.dsp || t.hard) {
                 for (const auto &[cell, hb] : hard_blocks) {
                     if (hb.gate_name != t.where && (hb.gate_name_alt.empty() || hb.gate_name_alt != t.where)) continue;
                     auto it = gold_by_where.find(cell);

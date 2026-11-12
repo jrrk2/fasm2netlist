@@ -5,6 +5,7 @@
 #include "bram_ports.hpp"
 #include "dsp_ports.hpp"
 #include "gtpins.hpp"
+#include "hardblock_ports.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -368,14 +369,25 @@ RegMap build_regmap(const std::string &placement_path, const std::string &gold_j
         }
     }
 
-    // The clock manager.  Only its LOCKED pin is paired, and only because it
-    // is the one Boolean thing about an MMCM; see the note in src/lvs/cone.cpp
-    // for what that does and does not establish.
+    // The clock managers and the ICAP, cut at every output (src/hardblock_ports.hpp): each output bit of the
+    // extracted block is the same free variable as the synthesis cell's.  The table is the synthesis
+    // primitive's, so a BASE clock manager pairs only the pins it has.  See src/lvs/cone.cpp for what the
+    // cut does and does not establish.  The ICAP is paired in the census below, where its site is resolved.
+    auto pair_outputs = [&](const std::string &gate, const std::string &cell, const std::string &type) {
+        for (const auto &p : hardblock::ports_of(type)) {
+            if (!p.out) continue;
+            for (int b = 0; b < (p.width ? p.width : 1); b++) {
+                const std::string suffix = std::string(":") + p.name + "[" + std::to_string(b) + "]";
+                out.mem[gate + suffix] = cell + suffix;
+            }
+        }
+    };
     for (const auto &pv : place.members()) {
         std::string bel = pv.second.get("bel").asString();
         if (bel != "MMCME2_ADV" && bel != "PLLE2_ADV") continue;
-        std::string gate = sanitise(pv.second.get("tile").asString() + "_MMCME2_ADV");
-        out.mem[gate + ":LOCKED[0]"] = pv.first + ":LOCKED[0]";
+        const json::Value &cell = mod->get("cells").get(pv.first);
+        const std::string type = cell.isNull() ? bel : cell.get("type").asString();
+        pair_outputs(sanitise(pv.second.get("tile").asString() + "_MMCME2_ADV"), pv.first, type);
     }
 
     // The hard-block census.  Every block the placement put somewhere, with
@@ -415,6 +427,8 @@ RegMap build_regmap(const std::string &placement_path, const std::string &gold_j
             // their boundary they pair like an ODDR, and without them every
             // ddram_* port differs on the strength of an undriven pad.
             "ISERDESE2", "OSERDESE2",
+            // The configuration port, cut at every pin as the clock managers are.
+            "ICAPE2",
         };
         // Enumerated from the SYNTHESIS, not from the placement.  The
         // placement is written at the end of place-and-route, so a cell that
@@ -497,8 +511,24 @@ RegMap build_regmap(const std::string &placement_path, const std::string &gold_j
                         if (halves[i].second == hb.site) fasm_site = "RAMB18_Y" + std::to_string(i);
                 }
                 if (!fasm_site.empty()) hb.gate_name = sanitise(tile + "_" + fasm_site);
-            } else if (bel == "MMCME2_ADV" || bel == "PLLE2_ADV") {
+            } else if (bel == "MMCME2_ADV" || bel == "PLLE2_ADV" || bel == "MMCME2_BASE" || bel == "PLLE2_BASE") {
                 hb.gate_name = sanitise(tile + "_MMCME2_ADV");
+            } else if (bel == "ICAPE2") {
+                // The placement names the device site, ICAP_X0Y1; the extraction names the site by its place in the tile, ICAP0 or ICAP1
+                // in the wire names.  Index the tile's ICAP sites, as the RAMB18 halves above are.
+                const json::Value &tv = grid.get(tile);
+                if (!tv.isNull()) {
+                    std::vector<std::pair<int, std::string>> at;
+                    for (const auto &sv : tv.get("sites").members()) {
+                        if (sv.first.rfind("ICAP_", 0) != 0) continue;
+                        auto y = sv.first.rfind('Y');
+                        if (y != std::string::npos) at.push_back({atoi(sv.first.c_str() + y + 1), sv.first});
+                    }
+                    std::sort(at.begin(), at.end());
+                    for (size_t i = 0; i < at.size(); i++)
+                        if (at[i].second == hb.site) hb.gate_name = sanitise(tile + "_ICAP_Y" + std::to_string(i));
+                }
+                if (!hb.gate_name.empty()) pair_outputs(hb.gate_name, cv.first, bel);
             } else if (bel == "DSP48E1") {
                 // The placement names the site as the device does, DSP48_X2Y56;
                 // the FASM and the tile model name it by its position within

@@ -36,6 +36,7 @@
 #include "bram_ports.hpp"
 #include "dsp_ports.hpp"
 #include "gtpins.hpp"
+#include "hardblock_ports.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -2201,29 +2202,108 @@ endmodule
         if (any) body << "  GTXE2_CHANNEL \\" << sanitise(kv.first + "_GTXE2_CHANNEL") << " (" << o.str() << ");\n";
     }
 
-    // ---- the clock manager's LOCKED pin --------------------------------
-    // The MMCM itself is not modelled and cannot usefully be: what comes out
-    // of it is a frequency, and this program only reasons about Boolean
-    // values.  But one of its pins IS Boolean -- LOCKED, which the reset
-    // circuit of practically every LiteX SoC reads -- and leaving it on the
-    // interconnect pull-up makes it a CONSTANT, so a reset synchroniser that
-    // waits for the PLL compares against 1 and differs for a reason that has
-    // nothing to do with the design.  Emitting the block with just that pin
-    // makes it a cut point instead: a free variable the placement can pair
-    // with the synthesis's own, which is what it honestly is.
+    // ---- the clock managers and the ICAP: cut at every pin -------------
+    // Neither is modelled and neither can usefully be: what comes out of an
+    // MMCM is a frequency, and what an ICAP does is read and write the
+    // configuration memory.  But the fabric reads Boolean things from both --
+    // LOCKED in practically every LiteX reset circuit, DO and DRDY in a DRP
+    // clock controller, O in anything that reads the configuration back -- and
+    // a pin left on the interconnect pull-up is a CONSTANT, so every register
+    // sampling it differs for a reason that has nothing to do with the design.
+    // So each block is emitted with its whole port list (src/hardblock_ports.hpp,
+    // the same table the checker and the register map use): every output a
+    // cut the placement pairs with the synthesis's own, every input other than
+    // a clock an obligation.  Bus pins are bit-numbered site pins (DADDR0..6,
+    // DI0..15, I0..31); a scalar is looked up by its exact name, since
+    // CLKOUT0..6 and CLKIN1/2 are separate ports and not a bus.
+    auto emit_hardblock = [&](const std::string &tile, const std::map<std::string, std::string> &per_site,
+                              const std::string &type, const std::string &iname, const std::string &params) {
+        std::ostringstream o;
+        bool first = true, touched = false;
+        for (const auto &port : hardblock::ports_of(type)) {
+            int n = port.width ? port.width : 1;
+            std::vector<std::string> bits;   // MSB first, as written
+            bool any = false;
+            for (int i = n - 1; i >= 0; i--) {
+                std::string pin = port.name;
+                if (port.width) pin += std::to_string(i);
+                std::string bit;
+                auto it = per_site.find(pin);
+                if (it != per_site.end()) {
+                    std::string rawnet = tw(tile, it->second);
+                    if (dsu.parent.count(rawnet)) touched = true;
+                    if (port.out) driven_raw.insert(rawnet);
+                    bit = emit_net(rawnet);
+                }
+                if (!bit.empty()) any = true;
+                bits.push_back(bit.empty() ? "1'b0" : bit);
+            }
+            if (!any) continue;
+            o << (first ? "" : ", ") << "." << port.name << "(";
+            first = false;
+            if (port.width) {
+                o << "{";
+                for (size_t i = 0; i < bits.size(); i++) o << (i ? ", " : "") << bits[i];
+                o << "}";
+            } else {
+                o << bits[0];
+            }
+            o << ")";
+        }
+        // A site whose pins the routing reaches nowhere is a site the design does not use: the database lists every site's pins.
+        if (first || !touched) return false;
+        body << "  " << type << " " << (params.empty() ? "" : "#(" + params + ") ") << "\\" << iname << " (" << o.str() << ");\n";
+        return true;
+    };
+    int clock_managers = 0, icaps = 0;
     for (const auto &kv : dc.other_tiles) {
         auto ti = tiles.find(kv.first);
-        if (ti == tiles.end() || ti->second.type.rfind("CMT_TOP", 0) != 0) continue;
-        for (const auto &pins : site_pins[ti->second.type]) {
-            auto lk = pins.find("LOCKED");
-            if (lk == pins.end()) continue;
-            std::string raw = tw(kv.first, lk->second);
-            driven_raw.insert(raw);
-            body << "  MMCME2_ADV \\" << sanitise(kv.first + "_MMCME2_ADV") << " (.LOCKED("
-                 << emit_net(raw) << "));\n";
-            break;
+        if (ti == tiles.end()) continue;
+        if (ti->second.type.rfind("CMT_TOP", 0) == 0) {
+            // One clock manager per CMT_TOP tile: the MMCM in a LOWER tile, the PLL in an UPPER one.  Told apart by the phase shifter,
+            // which only the MMCM has.  Named <tile>_MMCME2_ADV either way, which is what the register map pairs with.
+            for (const auto &pins : site_pins[ti->second.type]) {
+                if (!pins.count("LOCKED")) continue;
+                const std::string type = pins.count("PSEN") ? "MMCME2_ADV" : "PLLE2_ADV";
+                // The site's own inverters, as IS_<pin>_INVERTED so the checker applies them as it does the synthesis's.  For the clock
+                // managers a ZINV_ tag SET means the pin IS inverted -- the opposite of the Z convention elsewhere, and observed on
+                // hardware (nextpnr's fasm.cc, write_pll: the reverse held the PLL in reset).  nextpnr ties an input low by routing it
+                // to VCC_WIRE through the inverter, so without this every such pin reads 1.
+                std::string params;
+                auto tagged = [&](const std::string &name) {
+                    for (const auto &f : kv.second)
+                        if (f == type + "." + name) return true;
+                    return false;
+                };
+                std::vector<std::string> inv_pins = {"RST", "PWRDWN"};
+                if (type == "MMCME2_ADV") { inv_pins.push_back("PSEN"); inv_pins.push_back("PSINCDEC"); }
+                for (const auto &pin : inv_pins)
+                    params += (params.empty() ? "" : ", ") + std::string(".IS_") + pin + "_INVERTED(1'b" + (tagged("ZINV_" + pin) ? "1" : "0") + ")";
+                params += std::string(", .IS_CLKINSEL_INVERTED(1'b") + (tagged("INV_CLKINSEL") ? "1" : "0") + ")";
+                if (emit_hardblock(kv.first, pins, type, sanitise(kv.first + "_MMCME2_ADV"), params)) clock_managers++;
+                break;
+            }
+        } else if (ti->second.type.rfind("CFG_CENTER", 0) == 0) {
+            // Two ICAP sites, ICAP0 and ICAP1 in the wire names (the bottom and top sites); the one the routing reaches is the one in use.
+            // Its width is the one configuration bit the bitstream carries, ICAP.ICAP_WIDTH_X8/X16 (neither set is X32).
+            std::string width = "X32";
+            for (const auto &f : kv.second) {
+                if (f == "ICAP.ICAP_WIDTH_X8") width = "X8";
+                if (f == "ICAP.ICAP_WIDTH_X16") width = "X16";
+            }
+            for (const auto &pins : site_pins[ti->second.type]) {
+                auto cs = pins.find("CSIB");
+                if (cs == pins.end() || !pins.count("RDWRB")) continue;
+                auto at = cs->second.find("ICAP");
+                if (at == std::string::npos || at + 4 >= cs->second.size()) continue;
+                const std::string y(1, cs->second[at + 4]);
+                if (emit_hardblock(kv.first, pins, "ICAPE2", sanitise(kv.first + "_ICAP_Y" + y), ".ICAP_WIDTH(\"" + width + "\")"))
+                    icaps++;
+            }
         }
     }
+    if (clock_managers || icaps)
+        std::cerr << "  clock managers cut at their boundary: " << clock_managers << ", ICAPs: " << icaps << "\n";
 
     // now the module, in order: ports, internal nets, routing, instances.
     // Taken here, not earlier: resolving a slice's pins adds endpoints.
