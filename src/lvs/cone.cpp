@@ -271,11 +271,11 @@ bool bit_is_dontcare(const Expr &e, int bit)
 
 } // namespace
 
-Lit Cones::sym_state(const std::string &x)
+std::string Cones::shared_symbol(const std::string &x) const
 {
     auto r = rename_.find(x);
     if (r != rename_.end())
-        return net_.input(r->second);
+        return r->second;
     // A stored bit is named after the net its column reads onto, so it
     // inherits that net's renaming: rename the column and its whole contents
     // follow.  Without this the two sides would agree on the register that
@@ -284,9 +284,31 @@ Lit Cones::sym_state(const std::string &x)
     if (at != std::string::npos) {
         auto rr = rename_.find(x.substr(0, at));
         if (rr != rename_.end())
-            return net_.input(rr->second + x.substr(at));
+            return rr->second + x.substr(at);
     }
-    return net_.input(x);
+    return x;
+}
+
+int Cones::init_value(const std::string &state) const
+{
+    auto f = ff_by_state_.find(state);
+    if (f == ff_by_state_.end()) return -1;
+    auto init = f->second->param("INIT");
+    if (!init) return -1;
+    return int(parse_init(*init) & 1);
+}
+
+Lit Cones::sym_state(const std::string &x)
+{
+    // A register stored inverted reads the shared symbol negated
+    // (set_inverted).  Decided on the symbol, not on this side's name for it:
+    // a fabric net answers to every routing wire it passes through, and each
+    // of those is renamed to the same symbol.
+    const std::string s = shared_symbol(x);
+    auto k = constants_.find(s);
+    if (k != constants_.end()) return k->second ? LIT_TRUE : LIT_FALSE;
+    const Lit l = net_.input(s);
+    return inverted_.count(s) ? negate(l) : l;
 }
 
 std::string Cones::resolve(std::string n) const
@@ -577,8 +599,28 @@ void Cones::collect_mem_ports()
         return g;
     };
 
-    std::set<std::string> read_nets;   // nets something reads, for the dual-port RAMs below
+    std::set<std::string> read_nets;   // nets something reads, for the RAM ports below
     bool read_nets_built = false;
+    auto ensure_read_nets = [&]() {
+        if (read_nets_built) return;
+        read_nets_built = true;
+        auto note = [&](const Expr &e, const Instance *by, const std::string &pin) {
+            for (int b = 0, w = std::max(expr_width(e), 1); b < w; b++) {
+                std::string n = net_of_bit(e, b);
+                if (n.empty()) continue;
+                auto d = driver_.find(n);
+                const bool driving = d != driver_.end() && d->second.inst == by && d->second.pin == pin;
+                if (!driving) read_nets.insert(resolve(n));
+            }
+        };
+        for (const auto &i2 : mod_.instances)
+            for (const auto &p2 : i2.pins) note(p2.conn, &i2, p2.name);
+        for (const auto &a : mod_.assigns) note(a.rhs, nullptr, "");
+        for (const auto &pd : mod_.ports)
+            if (pd.dir != PortDecl::Dir::Input)
+                for (int b = 0; b < pd.range.width(); b++)
+                    read_nets.insert(resolve(pd.range.scalar ? pd.name : bit_name(pd.name, std::min(pd.range.msb, pd.range.lsb) + b)));
+    };
     for (const auto &inst : mod_.instances) {
         if (is_bram(inst.type)) {
             // A block RAM's boundary is its whole input side.  Listing it from
@@ -802,6 +844,21 @@ void Cones::collect_mem_ports()
             for (char port = 'A'; port <= 'D'; port++) {
                 std::string dopin = std::string("DO") + port;
                 if (!inst.find_pin(dopin)) continue;
+                // A port whose output nothing reads is not a read: yosys gives
+                // a three-reader memory's RAM32M a port A with its address
+                // left x and its output dangling.  Its write side is every
+                // other port's and is compared there, and an address of x
+                // against whatever the fabric wired is not a question.
+                ensure_read_nets();
+                {
+                    const Pin *op = inst.find_pin(dopin);
+                    bool read = false;
+                    for (int b = 0; b < width && !read; b++) {
+                        std::string on = net_of_bit(op->conn, b);
+                        if (!on.empty() && read_nets.count(resolve(on))) read = true;
+                    }
+                    if (!read) continue;
+                }
                 MemPort mp;
                 mp.where = inst.name + " port " + port;
                 mp.boundary.push_back(
@@ -828,25 +885,7 @@ void Cones::collect_mem_ports()
             // Two ports onto one memory, both written at A.  A port whose
             // output nothing reads is not one: the placer keeps no column for
             // it, and its write side is the other port's, compared there.
-            if (!read_nets_built) {
-                read_nets_built = true;
-                auto note = [&](const Expr &e, const Instance *by, const std::string &pin) {
-                    for (int b = 0, w = std::max(expr_width(e), 1); b < w; b++) {
-                        std::string n = net_of_bit(e, b);
-                        if (n.empty()) continue;
-                        auto d = driver_.find(n);
-                        const bool driving = d != driver_.end() && d->second.inst == by && d->second.pin == pin;
-                        if (!driving) read_nets.insert(resolve(n));
-                    }
-                };
-                for (const auto &i2 : mod_.instances)
-                    for (const auto &p2 : i2.pins) note(p2.conn, &i2, p2.name);
-                for (const auto &a : mod_.assigns) note(a.rhs, nullptr, "");
-                for (const auto &pd : mod_.ports)
-                    if (pd.dir != PortDecl::Dir::Input)
-                        for (int b = 0; b < pd.range.width(); b++)
-                            read_nets.insert(resolve(pd.range.scalar ? pd.name : bit_name(pd.name, std::min(pd.range.msb, pd.range.lsb) + b)));
-            }
+            ensure_read_nets();
             int abits = RAM_DUAL.at(inst.type);
             for (const char *port : {"SPO", "DPO"}) {
                 const Pin *op = inst.find_pin(port);
@@ -1329,10 +1368,9 @@ Lit Cones::eval_net(const std::string &raw, int depth)
         memo_[n] = result;
         return result;
     }
-    auto sym = [&](const std::string &x) {
-        auto r = rename_.find(x);
-        return net_.input(r == rename_.end() ? x : r->second);
-    };
+    // the shared symbol, in the counterpart's polarity where this side
+    // stores the register inverted (set_inverted)
+    auto sym = [&](const std::string &x) { return sym_state(x); };
     if (states_.count(n)) {
         // a register output is a free symbol -- shared with the other side
         result = sym(n);
@@ -1526,7 +1564,8 @@ Lit Cones::next_state(const std::string &state_name)
         std::string srval = param_str(ff, second ? "FF5_SRVAL" : "FF_SRVAL", "1'b0");
         bool sv = !srval.empty() && srval.back() == '1';
         next = sv ? net_.mk_or(sr, next) : net_.mk_and(negate(sr), next);
-        return next;
+        // in the counterpart's polarity (set_inverted)
+        return inverted_.count(shared_symbol(state_name)) ? negate(next) : next;
     }
 
     auto pin_lit = [&](const char *p, Lit dflt) {
@@ -1536,7 +1575,9 @@ Lit Cones::next_state(const std::string &state_name)
 
     Lit d = pin_lit("D", LIT_FALSE);
     Lit ce = pin_lit("CE", LIT_TRUE);
-    Lit q = net_.input(state_name);
+    // the held value is the same symbol every reader of Q sees: renamed and
+    // in the counterpart's polarity where this side is the renamed one
+    Lit q = sym_state(state_name);
     // CE low holds the current value
     Lit next = net_.mk_or(net_.mk_and(ce, d), net_.mk_and(negate(ce), q));
 
@@ -1555,7 +1596,7 @@ Lit Cones::next_state(const std::string &state_name)
         Lit pre = pin_lit("PRE", LIT_FALSE);
         next = net_.mk_or(pre, next);
     }
-    return next;
+    return inverted_.count(shared_symbol(state_name)) ? negate(next) : next;
 }
 
 int Cones::clock_inverted(const std::string &state) const

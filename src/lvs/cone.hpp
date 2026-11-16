@@ -71,6 +71,23 @@ class Cones
     // the same variables, and what justifies saying so is that their
     // boundaries prove equal.
     void set_mem_cuts(const std::map<std::string, std::string> &cuts) { mem_cut_ = cuts; }
+    // Shared symbols (the counterpart's state names) whose register on THIS
+    // side holds the complement: a synthesis that stores a bit inverted (every
+    // reader wanted the complement, so the inverter was folded into the
+    // register and its reset value) against one that does not.  This side
+    // reads such a symbol negated and reports that register's next state
+    // negated, so the miter asks the same question as before.
+    void set_inverted(const std::set<std::string> &symbols) { inverted_ = symbols; }
+    // Replace the rename given at construction.  Only before any cone has
+    // been evaluated: a memoised cone keeps the symbols it was built with.
+    void set_rename(const std::map<std::string, std::string> &rename) { rename_ = rename; }
+    // Registers (by their shared symbol) that provably hold a constant: a
+    // state that is never set and starts at its hold value.  Read as that
+    // constant, so a synthesis that kept such a register compares with one
+    // that removed it.  Only before any cone has been evaluated.
+    void set_constants(const std::map<std::string, bool> &c) { constants_ = c; }
+    // The register's INIT (power-up) value: 0, 1, or -1 when not a register or not given.
+    int init_value(const std::string &state) const;
 
     // memory_as_state makes a writable column's 64 stored bits state
     // elements, so a design containing distributed RAM can be reasoned about
@@ -172,6 +189,9 @@ class Cones
     std::vector<std::string> stack_;   // the descent, for naming a cycle
     std::map<std::string, Lit> memo_;
     std::map<std::string, std::string> rename_;   // this side's net -> shared symbol
+    std::set<std::string> inverted_;              // shared symbols this side stores complemented
+    std::map<std::string, bool> constants_;       // shared symbols this side holds constant (set_constants)
+    std::string shared_symbol(const std::string &x) const;   // this side's net -> the symbol both sides use
     // resolved net -> every name that resolves to it, built on first ask
     mutable std::map<std::string, std::set<std::string>> syn_;
     mutable bool syn_built_ = false;

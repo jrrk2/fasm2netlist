@@ -94,18 +94,32 @@ Module build_module(const std::string &mname, const json::Value &mod)
     std::vector<std::pair<std::string, int64_t>> aliases;
 
     // Ports first: a port's name is the bit's name, as in the Verilog, where
-    // the port wire is the one the instances connect to
+    // the port wire is the one the instances connect to.  A port's index
+    // range is in its netname entry (offset/upto: `input [5:1] addr`), and the
+    // bits are labelled with it, as the netname loop below labels them --
+    // else "addr[1]" names the port's second bit here and its first bit there,
+    // and the alias chain that follows folds the whole bus onto one net.
+    const json::Value &netnames = mod.get("netnames");
     for (const auto &pv : mod.get("ports").members()) {
         const auto &bits = pv.second.get("bits").items();
         PortDecl pd;
         const std::string dir = pv.second.get("direction").asString();
         pd.dir = dir == "input" ? PortDecl::Dir::Input : dir == "output" ? PortDecl::Dir::Output : PortDecl::Dir::Inout;
         pd.name = pv.first;
-        if (bits.size() > 1) pd.range = Range{int(bits.size()) - 1, 0, false};
+        int64_t offset = 0;
+        bool upto = false;
+        const json::Value &nn = netnames.get(pv.first);
+        if (!nn.isNull()) {
+            if (!nn.get("offset").isNull()) offset = nn.get("offset").asInt();
+            upto = !nn.get("upto").isNull() && nn.get("upto").asInt() != 0;
+        }
+        if (bits.size() > 1) pd.range = Range{int(offset + int64_t(bits.size()) - 1), int(offset), false};
         m.ports.push_back(pd);
         for (size_t i = 0; i < bits.size(); i++) {
             if (bits[i].type != json::Type::Int) continue;
-            canon.emplace(bits[i].asInt(), bit_label(pv.first, bits.size(), int64_t(i)));
+            const int64_t idx = offset + (upto ? int64_t(bits.size()) - 1 - int64_t(i) : int64_t(i));
+            const std::string nm = bits.size() == 1 && offset == 0 ? pv.first : pv.first + "[" + std::to_string(idx) + "]";
+            canon.emplace(bits[i].asInt(), nm);
         }
     }
     // Then the named signals, in the JSON's order: the first name a bit has
